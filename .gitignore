@@ -1,0 +1,6 @@
+data/
+results/
+results_finetune/
+results_finetune_fusion/
+__pycache__/
+*.pyc
