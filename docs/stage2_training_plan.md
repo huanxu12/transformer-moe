@@ -46,4 +46,66 @@
 - 记录训练命令、参数、日志路径。
 - 保存模型权重并更新 README/文档说明。
 - 在 `docs/stage2_tracking.md` 更新 T2.5 状态及备注。
-\n## 7. ΢调执行指南\n- 使用 `train_multimodal.py` 时，可通过新参数快速配置：\n  ```bash\n  python train_multimodal.py \\\n      --data_path data \\\n      --pointcloud_path data/pointclouds \\\n      --train_sequences 00,01,02,03,04,05,06,07,08 \\\n      --finetune_checkpoint pretrain_models/multimodal_initial.pth \\\n      --freeze_visual \\\n      --learning_rate 5e-5 \\\n      --num_epochs 5 \\\n      --output_checkpoint pretrain_models/multimodal_finetuned.pth \\\n      --log_csv logs/finetune.csv \\\n      --save_every_epoch 1\n  ```\n- 关键参数说明：\n  - `--train_sequences`：指定参与训练的 KITTI 序列，自动补零。\n  - `--finetune_checkpoint` / `--resume_optimizer`：加载现有模型和优化器状态，实现继续训练。\n  - `--freeze_visual` / `--freeze_point` / `--freeze_imu`：按需冻结子模态，聚焦特定分支。\n  - `--output_checkpoint` 与 `--save_every_epoch`：控制最终及阶段性权重输出。\n  - `--log_csv`：输出 `epoch, loss` 记录，便于后续绘制 loss 曲线。\n- 默认为 batch size 1；若需要更高 batch size，需改进 `collate_fn` 后再开启。\n
+\n## 7. 微调执行指南
+- 使用 `train_multimodal.py` 时，可通过下方命令模板快速配置：
+  ```bash
+  python train_multimodal.py \
+      --data_path data \
+      --pointcloud_path data/pointclouds \
+      --train_sequences 00,01,02,03,04,05,06,07,08 \
+      --imu_stats data/imu_stats.json \
+      --imu_gravity_axis 2 \
+      --imu_gravity_value 9.81 \
+      --finetune_checkpoint pretrain_models/multimodal_initial.pth \
+      --freeze_visual \
+      --learning_rate 5e-5 \
+      --num_epochs 5 \
+      --output_checkpoint pretrain_models/multimodal_finetuned.pth \
+      --log_csv logs/finetune.csv \
+      --save_every_epoch 1
+  ```
+- 关键参数说明：
+  - `--train_sequences`：指定参与训练的 KITTI 序列，会自动补零。
+  - `--imu_stats` / `--imu_gravity_axis` / `--imu_gravity_value`：加载归一化统计并去除重力偏置，训练/评估需保持一致。
+  - `--finetune_checkpoint` / `--resume_optimizer`：加载现有模型与优化器，实现继续训练。
+  - `--freeze_visual` / `--freeze_point` / `--freeze_imu`：按需冻结子模态，聚焦特定分支。
+  - `--output_checkpoint` 与 `--save_every_epoch`：控制最终及阶段性权重输出。
+  - `--log_csv`：输出 `epoch, loss` 记录，便于绘制 loss 曲线。
+- 默认 batch size 为 1；若需更大 batch，需要改进 `collate_fn` 后再启用。
+## 8. IMU 归一化流程
+
+## 9. 训练优化策略
+
+#### 最新结果：Epoch 12 早停 + ReduceLROnPlateau
+- 最优验证位于第 9 epoch（trans_rmse=0.1680 m, rot_rmse=0.0024 rad）。
+- 评估（09/10）：trans_rmse=0.1673 m, rot_rmse=0.00243 rad；ATE_rmse=61.36 m, RPE_trans_rmse=0.2849 m, RPE_rot_rmse=0.2406°。
+- 相比原始 BotVIO：ATE_rmse 降约 18%，RPE_trans_rmse 降约 24%，RPE_rot_rmse 降约 7%。
+
+### 阶段一：监控与早停
+- 将 KITTI 09/10 作为固定验证集，每个 epoch（或每隔 N 个 epoch）执行 `evaluations/eval_multimodal.py`，记录平移/旋转误差到 `results/history_epochXX.json`。
+- 当验证平移 RMSE 连续 3~4 次未下降 ≥1% 或出现回升时提前停止，并保留指标最优的 checkpoint。
+### 阶段二：学习率调度
+- 初始学习率保持 5e-5 训练约 10 个 epoch；若验证集指标停滞，降至 1e-5，再视情况调整至 5e-6。
+- 可替换为 `ReduceLROnPlateau` 或分阶段重新启动训练脚本以实现多段学习率。
+### 阶段三：正则化增强（后续）
+- 适当提高 `weight_decay`、在 `Trans_Fusion`/`PoseRegressor` 中引入 Dropout，评估对验证集的影响。
+- 尝试冻结部分编码器层以防止过拟合。
+### 阶段四：数据增强（后续）
+- 扩展图像、点云与 IMU 的随机扰动，模拟真实传感器噪声。
+### 阶段五：实验管理（后续）
+- 每次策略调整单独记录日志/权重目录，并保留轨迹图用于结果对比。
+
+- 使用 `_tmp_compute_imu.py` 计算均值与方差：例如 `python _tmp_compute_imu.py --data_path data --train_sequences 00,01,02,03,04,05,06,07,08 --imu_gravity_axis 2 --imu_gravity_value 9.81`，脚本会在写入 `data/imu_stats.json` 前对归一化后的均值/方差做断言。
+- 训练时为 `train_multimodal.py` 追加 `--imu_stats data/imu_stats.json`，如需去除重力偏置再传入 `--imu_gravity_axis 2 --imu_gravity_value 9.81`。
+- 评估脚本 `evaluations/eval_multimodal.py`、`evaluate_pose_multimodal.py` 同样接受以上参数，确保推理阶段使用相同的归一化配置。
+- 若需要重新生成统计值，删除旧的 `imu_stats.json` 后重复第一步。`_tmp_compute_imu.py --limit` 可用于抽样验证流程是否正常。
+### 阶段三：正则化增强（待执行）
+- weight decay：在现有 1e-2 基础上试验 3e-2 / 5e-2，观察验证平移 RMSE 变化，保留最优值。
+- Dropout：
+  1. 在 `Trans_Fusion` 初始化传入 `drop_prob=0.1`；
+  2. 在 `PoseRegressor` 的两层全连接之间插入 `nn.Dropout(0.1)`；
+  3. 逐步增大至 0.2，评估验证指标。
+- 编码器冻结：
+  - 初始阶段冻结视觉编码器前两层；
+  - 视验证集表现，尝试同时冻结 PointEncoder 的前两层，以降低过拟合。
+- 实验流程：单次仅改一个因素，沿用当前验证配置（09/10），记录 `results/val_history/` 与 `results_finetune_*` 指标。最佳组合固化为新基线。

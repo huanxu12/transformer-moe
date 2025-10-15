@@ -1,8 +1,9 @@
-import argparse
+﻿import argparse
 import math
 import os
 import pickle
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from tqdm import tqdm
 
 from evaluations.options import BotVIOOptions
@@ -107,6 +108,59 @@ def to_device(tensor, device):
     return torch.as_tensor(tensor, dtype=torch.float32, device=device)
 
 
+def _get_imu_norm_tensors(opts, device):
+    stats_path = getattr(opts, 'imu_stats', None)
+    if not stats_path:
+        return None
+    cache = getattr(opts, '_imu_stats_cache', None)
+    if cache is None:
+        cache = {}
+        setattr(opts, '_imu_stats_cache', cache)
+    stats_file = Path(stats_path).expanduser()
+    cache_key = (str(stats_file.resolve(strict=False)), device.type, getattr(device, 'index', None))
+    tensors = cache.get(cache_key)
+    if tensors is None:
+        if not stats_file.exists():
+            raise FileNotFoundError(f"IMU normalization file not found: {stats_file}")
+        with stats_file.open('r', encoding='utf-8') as handle:
+            stats = json.load(handle)
+        if 'mean' not in stats or 'std' not in stats:
+            raise ValueError(f"IMU normalization file {stats_file} must contain 'mean' and 'std'")
+        mean = torch.tensor(stats['mean'], dtype=torch.float32, device=device)
+        std = torch.tensor(stats['std'], dtype=torch.float32, device=device).clamp_min(1e-6)
+        if mean.ndim != 1 or std.ndim != 1 or mean.shape != std.shape:
+            raise ValueError(f"Invalid IMU stats in {stats_file}: mean/std must be 1D tensors of equal length")
+        cache[cache_key] = (mean, std)
+        tensors = cache[cache_key]
+    return tensors
+
+
+def _apply_imu_normalization(imu_tensor, opts, device):
+    channels = imu_tensor.shape[-1]
+    gravity_axis = getattr(opts, 'imu_gravity_axis', None)
+    if gravity_axis is not None:
+        axis = int(gravity_axis)
+        if axis < -channels or axis >= channels:
+            raise ValueError(
+                f"imu_gravity_axis={axis} is outside valid range for tensor with {channels} channels"
+            )
+        gravity_value = float(getattr(opts, 'imu_gravity_value', 9.81))
+        imu_tensor = imu_tensor.clone()
+        imu_tensor[..., axis] = imu_tensor[..., axis] - gravity_value
+    tensors = _get_imu_norm_tensors(opts, device)
+    if tensors is not None:
+        mean, std = tensors
+        if mean.shape[0] != channels:
+            raise ValueError(
+                f"IMU stats channel mismatch: expected {channels}, got {mean.shape[0]}"
+            )
+        view_shape = (1,) * (imu_tensor.dim() - 1) + (channels,)
+        mean_view = mean.view(*view_shape)
+        std_view = std.view(*view_shape)
+        imu_tensor = (imu_tensor - mean_view) / std_view
+    return imu_tensor
+
+
 class MultimodalModel(nn.Module):
     def __init__(self, opts):
         super().__init__()
@@ -151,6 +205,7 @@ def prepare_batch(inputs, device, opts):
     if imu.dim() == 2:
         imu = imu.unsqueeze(0)
     imu = imu.to(device)
+    imu = _apply_imu_normalization(imu, opts, device)
 
     pc_tensor = inputs[("pointcloud", 0, 0)]
     if not isinstance(pc_tensor, torch.Tensor):
@@ -186,7 +241,7 @@ def prepare_batch(inputs, device, opts):
         'point_valid': point_valid
     }
 
-def train_epoch(model, loader, optimizer, scheduler, device, pose_cache, opts):
+def train_epoch(model, loader, optimizer, scheduler, device, pose_cache, opts, use_batch_scheduler=False):
     model.train()
     total_loss = 0.0
     criterion = nn.L1Loss()
@@ -206,13 +261,84 @@ def train_epoch(model, loader, optimizer, scheduler, device, pose_cache, opts):
         loss = loss_trans + 0.1 * loss_rot
         loss.backward()
         optimizer.step()
-        if scheduler is not None:
+        if use_batch_scheduler and scheduler is not None:
             scheduler.step()
         total_loss += loss.item()
         progress.set_postfix(loss=loss.item())
     progress.close()
     return total_loss / max(1, len(loader))
 
+
+
+def run_validation(model, device, opts, val_sequences, epoch):
+    val_file_list = build_file_list(opts.data_path, sequences=val_sequences)
+    val_dataset = KITTIOdomPointDataset(
+        opts.data_path,
+        val_file_list,
+        opts.height,
+        opts.width,
+        frame_idxs=[0],
+        num_scales=1,
+        is_train=False,
+        img_ext='.png',
+        pointcloud_path=opts.pointcloud_path or os.path.join(opts.data_path, 'pointclouds'),
+        pc_max_points=opts.pc_max_points,
+        pc_min_range=opts.pc_min_range,
+        pc_max_range=opts.pc_max_range,
+        return_intensity=True
+    )
+    loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=opts.num_workers,
+        collate_fn=collate_fn
+    )
+
+    totals = {
+        'rot_mae': 0.0,
+        'rot_rmse': 0.0,
+        'rot_angle_deg': 0.0,
+        'trans_mae': 0.0,
+        'trans_rmse': 0.0,
+        'trans_l2': 0.0,
+    }
+    count = 0
+    pose_cache = {}
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            inputs = prepare_batch(batch, device, opts)
+            rot_pred, trans_pred = model(inputs)
+            rot_vec = rot_pred.squeeze(0).detach().cpu().numpy()
+            trans_vec = trans_pred.squeeze(0).detach().cpu().numpy()
+
+            seq, frame = batch['filename'].split()[:2]
+            rot_gt, trans_gt = relative_pose(pose_cache, opts.data_path, seq, int(frame))
+
+            rot_diff = rot_vec - rot_gt
+            trans_diff = trans_vec - trans_gt
+
+            totals['rot_mae'] += float(np.mean(np.abs(rot_diff)))
+            totals['rot_rmse'] += float(np.mean(rot_diff ** 2))
+            totals['rot_angle_deg'] += float(np.linalg.norm(rot_diff) * (180.0 / np.pi))
+            totals['trans_mae'] += float(np.mean(np.abs(trans_diff)))
+            totals['trans_rmse'] += float(np.mean(trans_diff ** 2))
+            totals['trans_l2'] += float(np.linalg.norm(trans_diff))
+            count += 1
+
+    if count == 0:
+        raise RuntimeError('Validation dataset is empty')
+
+    totals['rot_mae'] /= count
+    totals['rot_rmse'] = float(np.sqrt(totals['rot_rmse'] / count))
+    totals['rot_angle_deg'] /= count
+    totals['trans_mae'] /= count
+    totals['trans_rmse'] = float(np.sqrt(totals['trans_rmse'] / count))
+    totals['trans_l2'] /= count
+
+    model.train()
+    return totals, count
 
 def main():
     opts = BotVIOOptions().parse()
@@ -284,7 +410,26 @@ def main():
     elif opts.resume_optimizer and not checkpoint_state:
         print("[train_multimodal] --resume_optimizer specified but no checkpoint was loaded")
 
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(1, len(loader)))
+    val_sequences = _parse_sequences(getattr(opts, 'val_sequences', None)) if getattr(opts, 'val_sequences', None) else None
+    use_validation = bool(val_sequences)
+
+    if use_validation:
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=opts.lr_plateau_factor,
+                                      patience=opts.lr_plateau_patience, verbose=True)
+        val_metrics_dir = Path(opts.val_metrics_dir) if opts.val_metrics_dir else None
+        if val_metrics_dir:
+            val_metrics_dir.mkdir(parents=True, exist_ok=True)
+        best_checkpoint_path = Path(opts.best_checkpoint) if opts.best_checkpoint else None
+        if best_checkpoint_path:
+            best_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        best_val_metric = None
+        patience_counter = 0
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=max(1, len(loader)))
+        val_metrics_dir = None
+        best_checkpoint_path = None
+        best_val_metric = None
+        patience_counter = 0
 
     pose_cache = {}
     history = []
@@ -296,7 +441,10 @@ def main():
         log_path.parent.mkdir(parents=True, exist_ok=True)
         csv_handle = log_path.open('w', newline='', encoding='utf-8')
         csv_writer = csv.writer(csv_handle)
-        csv_writer.writerow(['epoch', 'loss'])
+        header = ['epoch', 'loss']
+        if use_validation:
+            header.extend(['val_trans_rmse', 'val_rot_rmse'])
+        csv_writer.writerow(header)
 
     output_path = Path(opts.output_checkpoint)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -308,17 +456,60 @@ def main():
             'history': history
         }, target_path)
 
+    stop_training = False
+    val_interval = max(1, getattr(opts, 'val_interval', 1))
+
     for epoch in range(opts.num_epochs):
-        loss = train_epoch(model, loader, optimizer, scheduler, device, pose_cache, opts)
-        history.append({'epoch': epoch + 1, 'loss': loss})
+        loss = train_epoch(model, loader, optimizer, scheduler, device, pose_cache, opts,
+                           use_batch_scheduler=not use_validation)
+
+        record = {'epoch': epoch + 1, 'loss': loss}
         print(f"Epoch {epoch + 1}/{opts.num_epochs}: loss={loss:.4f}")
+
+        val_metrics = None
+        if use_validation and ((epoch + 1) % val_interval == 0):
+            val_metrics, val_count = run_validation(model, device, opts, val_sequences, epoch + 1)
+            record['val_trans_rmse'] = val_metrics['trans_rmse']
+            record['val_rot_rmse'] = val_metrics['rot_rmse']
+            print(f"  Validation (epoch {epoch + 1}): trans_rmse={val_metrics['trans_rmse']:.4f}, rot_rmse={val_metrics['rot_rmse']:.4f}")
+
+            if val_metrics_dir:
+                epoch_file = val_metrics_dir / f"epoch{epoch + 1:03d}.json"
+                with epoch_file.open('w', encoding='utf-8') as handle:
+                    json.dump({'epoch': epoch + 1, 'samples': val_count, 'metrics': val_metrics}, handle, indent=2)
+
+            scheduler.step(val_metrics['trans_rmse'])
+
+            improved = (best_val_metric is None) or (best_val_metric - val_metrics['trans_rmse'] > opts.early_stop_min_delta)
+            if improved:
+                best_val_metric = val_metrics['trans_rmse']
+                patience_counter = 0
+                if best_checkpoint_path:
+                    dump_checkpoint(best_checkpoint_path)
+                    print(f"  Best checkpoint updated at {best_checkpoint_path}")
+            else:
+                patience_counter += 1
+                if opts.early_stop_patience > 0 and patience_counter >= opts.early_stop_patience:
+                    print(f"[train_multimodal] Early stopping triggered at epoch {epoch + 1}")
+                    stop_training = True
+
+        history.append(record)
+
         if csv_writer:
-            csv_writer.writerow([epoch + 1, f"{loss:.6f}"])
+            row = [epoch + 1, f"{loss:.6f}"]
+            if use_validation:
+                row.append(f"{record.get('val_trans_rmse', float('nan')):.6f}" if 'val_trans_rmse' in record else '')
+                row.append(f"{record.get('val_rot_rmse', float('nan')):.6f}" if 'val_rot_rmse' in record else '')
+            csv_writer.writerow(row)
             csv_handle.flush()
+
         if opts.save_every_epoch > 0 and (epoch + 1) % opts.save_every_epoch == 0:
             interim_name = output_path.with_name(f"{output_path.stem}_epoch{epoch + 1}{output_path.suffix}")
             dump_checkpoint(interim_name)
             print(f"  Saved interim checkpoint to {interim_name}")
+
+        if stop_training:
+            break
 
     if csv_handle:
         csv_handle.close()
@@ -333,3 +524,9 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+

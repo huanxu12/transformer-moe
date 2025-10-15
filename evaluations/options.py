@@ -151,7 +151,38 @@ class BotVIOOptions:
                                  type=float,
                                  help="learning rate for optimizers",
                                  default=1e-4)
-
+        self.parser.add_argument("--val_sequences",
+                                 type=str,
+                                 help="comma-separated sequence ids used for on-the-fly validation during training",
+                                 default=None)
+        self.parser.add_argument("--val_interval",
+                                 type=int,
+                                 help="run validation every N epochs (requires --val_sequences)",
+                                 default=1)
+        self.parser.add_argument("--val_metrics_dir",
+                                 type=str,
+                                 help="directory to store per-epoch validation metrics JSON",
+                                 default=None)
+        self.parser.add_argument("--best_checkpoint",
+                                 type=str,
+                                 help="path to save checkpoint with best validation performance",
+                                 default=None)
+        self.parser.add_argument("--early_stop_patience",
+                                 type=int,
+                                 help="epochs without validation improvement before early stopping",
+                                 default=0)
+        self.parser.add_argument("--early_stop_min_delta",
+                                 type=float,
+                                 help="minimum improvement in validation metric to reset patience",
+                                 default=1e-3)
+        self.parser.add_argument("--lr_plateau_factor",
+                                 type=float,
+                                 help="factor to reduce LR on plateau when validation is enabled",
+                                 default=0.3)
+        self.parser.add_argument("--lr_plateau_patience",
+                                 type=int,
+                                 help="patience for LR reduction on plateau (validation only)",
+                                 default=2)
         # SYSTEM options
         self.parser.add_argument("--no_cuda",
                                  help="if set disables CUDA",
@@ -224,8 +255,22 @@ class BotVIOOptions:
                                  default=256,
                                  help='imu feature length')
 
+        self.parser.add_argument('--imu_stats',
+                                 type=str,
+                                 default=None,
+                                 help='optional path to IMU normalization stats (JSON with mean/std)')
+        self.parser.add_argument('--imu_gravity_axis',
+                                 type=int,
+                                 default=None,
+                                 help='axis index (0:x, 1:y, 2:z) to subtract gravity from after normalization')
+        self.parser.add_argument('--imu_gravity_value',
+                                 type=float,
+                                 default=9.81,
+                                 help='gravity magnitude to subtract when --imu_gravity_axis is set')
+
     def parse(self):
         self.options = self.parser.parse_args()
         return self.options
+
 
 

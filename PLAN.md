@@ -74,3 +74,23 @@
 - 每项任务完成后必须对照本计划检查是否偏离；如有偏差需要在跟踪文档中记录原因和应对策略。
 - 开发、测试、文档更新需同步进行，确保可重现性。
 - 任何超出计划的工作需评估后再执行，避免资源分散。
+
+## Appendix: IMU Normalization Plan
+1. Compute IMU mean/std on training sequences and save them to data/imu_stats.json (keep the command template in README/tools).
+2. Add --imu_stats, --imu_gravity_axis, --imu_gravity_value options in BotVIOOptions and pass them during training/evaluation runs.
+3. Apply (imu - mean) / std inside prepare_batch; subtract the gravity constant from the configured axis when needed.
+4. To roll back, remove the CLI options, delete the normalization block, and drop data/imu_stats.json.
+
+## Appendix: Training Optimization Roadmap
+### Latest Run Summary (Epoch 12 early stop, ReduceLROnPlateau)
+- Validation best at epoch 9: trans_rmse=0.1680 m, rot_rmse=0.0024 rad (logs/finetune.csv, results/val_history/epoch009.json).
+- Final evaluation (pretrain_models/multimodal_finetuned_best.pth) on 09/10: trans_rmse=0.1673 m, rot_rmse=0.00243 rad (results/finetune_eval_metrics.json).
+- Odom metrics after evaluate_pose_multimodal + eval_odom: ATE_rmse=61.36 m, RPE_trans_rmse=0.2849 m, RPE_rot_rmse=0.2406 deg (results_finetune_best/metrics_odom.json).
+- Compared to original BotVIO (results_finetune_fusion/metrics_finetune.json): ATE_rmse ↓13.9 m (~18%), RPE_trans_rmse ↓0.0897 m (~24%), RPE_rot_rmse ↓0.018 deg (~7%).
+
+1. Phase 1 (Early stopping): enable validation on KITTI 09/10 each epoch, persist metrics under `results/history_epochXX.json`, and stop when translation RMSE fails to improve beyond 1% for 3 consecutive evaluations.
+2. Phase 2 (Learning-rate scheduling): switch from batch-wise cosine decay to validation-driven `ReduceLROnPlateau`; decay LR by factor 0.3 after 2 stagnant validations and continue training with checkpoints for each epoch.
+3. Phase 3 (Regularization, TODO): experiment with higher `weight_decay`, Dropout in `Trans_Fusion`/`PoseRegressor`, and selective encoder freezing to mitigate overfitting.
+4. Phase 4 (Data augmentation, TODO): extend visual/point/IMU augmentations to simulate realistic noise and improve robustness.
+5. Phase 5 (Experiment management, TODO): formalize run naming, metric aggregation, and trajectory plotting comparisons for reproducible reporting.
+

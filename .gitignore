@@ -4,3 +4,4 @@ results_finetune/
 results_finetune_fusion/
 __pycache__/
 *.pyc
+pretrain_models/

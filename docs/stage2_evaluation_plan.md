@@ -14,7 +14,10 @@
        --pointcloud_path data/pointclouds \
        --num_workers 0 \
        --eval_sequences 09,10 \
-       --checkpoint_path pretrain_models/multimodal_initial.pth \
+       --imu_stats data/imu_stats.json \
+       --imu_gravity_axis 2 \
+       --imu_gravity_value 9.81 \
+       --checkpoint_path pretrain_models/multimodal_finetuned.pth \
        --results_dir results --overwrite_results
    ```
 3. 轨迹可视化（已完成）：使用 `evaluations/plot_trajectories.py` 绘制预测与 GT 对比图。
