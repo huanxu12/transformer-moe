@@ -99,13 +99,89 @@
 - 训练时为 `train_multimodal.py` 追加 `--imu_stats data/imu_stats.json`，如需去除重力偏置再传入 `--imu_gravity_axis 2 --imu_gravity_value 9.81`。
 - 评估脚本 `evaluations/eval_multimodal.py`、`evaluate_pose_multimodal.py` 同样接受以上参数，确保推理阶段使用相同的归一化配置。
 - 若需要重新生成统计值，删除旧的 `imu_stats.json` 后重复第一步。`_tmp_compute_imu.py --limit` 可用于抽样验证流程是否正常。
-### 阶段三：正则化增强（待执行）
-- weight decay：在现有 1e-2 基础上试验 3e-2 / 5e-2，观察验证平移 RMSE 变化，保留最优值。
-- Dropout：
-  1. 在 `Trans_Fusion` 初始化传入 `drop_prob=0.1`；
-  2. 在 `PoseRegressor` 的两层全连接之间插入 `nn.Dropout(0.1)`；
-  3. 逐步增大至 0.2，评估验证指标。
-- 编码器冻结：
-  - 初始阶段冻结视觉编码器前两层；
-  - 视验证集表现，尝试同时冻结 PointEncoder 的前两层，以降低过拟合。
-- 实验流程：单次仅改一个因素，沿用当前验证配置（09/10），记录 `results/val_history/` 与 `results_finetune_*` 指标。最佳组合固化为新基线。
+### 阶段三：正则化实验执行
+- `weight_decay` 调参：
+  - 在 `--weight_decay` 基础值 1e-2 上追加 3e-2、5e-2 轮次，保持其他超参不变。
+  - 每轮结束后追踪 `results/val_history/epochXXX.json` 与 `logs/finetune.csv` 的 `trans_rmse` 记录，整理到阶段三表格。
+- Dropout 试验：
+  - `Trans_Fusion` 通过 `--fusion_drop_prob` 控制；先设 0.1，如验证收益稳定再提升至 0.2。
+  - `PoseRegressor` 使用 `--pose_dropout` 在两层全连接之间插入 Dropout，同步递增与融合侧保持一致。
+  - 单次实验仅调整一个 Dropout 值，复用其余配置，便于定位收益来源。
+- 编码器前段冻结：
+  - 视觉编码器用 `--freeze_visual_blocks 2` 冻结前两个卷积块，若验证指标继续改善，再以 `--freeze_point_layers 1` 冻结点云编码器首段进行对比。
+  - 如需完整冻结仍可启用 `--freeze_visual`、`--freeze_point`，用于与部分冻结差异分析。
+- 实验节奏：
+  1. 在阶段二的 09/10 验证方案上复现 baseline（ReduceLROnPlateau+早停保持不变）。
+  2. 依次完成 weight_decay 扫描 → Dropout 递增 → 编码器冻结，期间每次仅变动一个因素。
+  3. 运行结束后更新 `logs/finetune.csv`、`results/val_history/`，并在阶段计划中记录最佳组合与改进幅度。
+- 命令示例（根据需要替换可调参数）：
+  ```bash
+  python train_multimodal.py \
+      --data_path data \
+      --pointcloud_path data/pointclouds \
+      --train_sequences 00,01,02,03,04,05,06,07,08 \
+      --val_sequences 09,10 \
+      --finetune_checkpoint pretrain_models/multimodal_initial.pth \
+      --output_checkpoint pretrain_models/multimodal_stage3.pth \
+      --log_csv logs/stage3_wd003.csv \
+      --val_metrics_dir results/val_history \
+      --best_checkpoint pretrain_models/multimodal_stage3_best.pth \
+      --num_epochs 15 \
+      --weight_decay 0.03 \
+      --fusion_drop_prob 0.1 \
+      --pose_dropout 0.0 \
+      --freeze_visual_blocks 2
+  ```
+  在 Dropout、冻结实验中，只改动对应参数（如 `--fusion_drop_prob 0.2` 或 `--freeze_point_layers 1`），其余保持基准设置，便于快速比对验证指标。
+
+- 验证/里程计评估命令：
+  ```bash
+  python evaluations/evaluate_pose_multimodal.py \
+      --data_path data \
+      --pointcloud_path data/pointclouds \
+      --eval_sequences 09,10 \
+      --checkpoint_path pretrain_models/multimodal_stage3_baseline_best.pth \
+      --results_dir results/stage3_baseline_traj \
+      --overwrite_results
+  ```
+  ```bash
+  python evaluations/eval_odom.py \
+      --data_path data \
+      --pred_dir results/stage3_baseline_traj \
+      --sequences 09,10 \
+      --json_output results/stage3_baseline_odom.json
+  ```
+- 基线复现（2025-10-15）：
+  - 验证最佳：epoch 14，trans_rmse=0.1451 m，rot_rmse=0.00278 rad（results/val_history/epoch014.json）。
+  - 里程计：ATE_rmse=36.80 m，RPE_trans_rmse=0.2506 m，RPE_rot_rmse=0.2702°（results/stage3_baseline_odom.json）。
+
+- weight_decay=0.03 对比：
+  - 验证最佳：epoch 12，trans_rmse=0.1540 m，rot_rmse=0.0030 rad（logs/stage3_wd003.csv, results/val_history/epoch012.json）。
+  - 里程计：ATE_rmse=75.58 m，RPE_trans_rmse=0.2667 m，RPE_rot_rmse=0.2847°（results/stage3_wd003_odom.json）。
+  - 结论：相对基线平移/里程计误差增大，暂不列入候选组合。
+
+- weight_decay=0.015 对比：
+  - 验证最佳：epoch 12，trans_rmse=0.1673 m，rot_rmse=0.0030 rad（logs/stage3_wd0015.csv, results/val_history/epoch012.json）。
+  - 里程计：ATE_rmse=58.49 m，RPE_trans_rmse=0.2877 m，RPE_rot_rmse=0.2974°（results/stage3_wd0015_odom.json）。
+  - 结论：较基线平移/里程计误差均上升，效果不佳。
+
+- weight_decay=0.02 对比：
+  - 验证最佳：epoch 14，trans_rmse=0.1419 m，rot_rmse=0.0034 rad（logs/stage3_wd002.csv, results/val_history/epoch014.json）。
+  - 里程计：ATE_rmse=151.31 m，RPE_trans_rmse=0.2450 m，RPE_rot_rmse=0.3316°（results/stage3_wd002_odom.json）。
+  - 结论：轨迹偏差显著放大，判定为失败实验。
+
+- fusion_drop_prob=0.10 试验：
+  - 验证：epoch 11 trans_rmse=0.1500 m，rot_rmse=0.0032 rad（pretrain_models/multimodal_stage3_fdrop010_best.pth）
+  - 里程计：seq09 ATE=79.14 m、seq10 ATE=16.36 m，总体 ATE_rmse=52.14 m，RPE_trans=0.2608 m，RPE_rot=0.316°（results/stage3_fdrop010_odom.json）
+  - 结论：相较 baseline 有轻微退化，可作为 fusion Dropout 上限使用，不建议继续拉高取值。
+
+- fusion_drop_prob=0.15 试验：
+  - 验证：epoch 5 trans_rmse=0.1583 m，rot_rmse=0.0039 rad（pretrain_models/multimodal_stage3_fdrop015_best.pth）
+  - 里程计：seq09 ATE=85.56 m、seq10 ATE=57.63 m，总体 ATE_rmse=73.55 m，RPE_trans=0.2735 m，RPE_rot=0.379°（results/stage3_fdrop015_odom.json）
+  - 结论：高 Dropout 导致 ATE 剧增，判定为失败实验。
+
+- fusion_drop_prob=0.20 试验：
+  - 验证：epoch 13 trans_rmse=0.1701 m，rot_rmse=0.0034 rad（pretrain_models/multimodal_stage3_fdrop020_best.pth）
+  - 里程计：seq09 ATE=52.60 m、seq10 ATE=57.07 m，总体 ATE_rmse=54.52 m，RPE_trans=0.2963 m，RPE_rot=0.328°（results/stage3_fdrop020_odom.json）
+  - 结论：无性能提升且 ATE 仍偏高，判定为失败实验。
+

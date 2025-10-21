@@ -1,4 +1,6 @@
 ﻿import os
+import math
+import random
 import numpy as np
 import torch
 
@@ -7,7 +9,7 @@ from util import pointcloud_ops
 
 
 class KITTIOdomPointDataset(KITTIOdomDataset):
-    """KITTI odometry dataset with point cloud support."""
+    """KITTI odometry dataset with point cloud support and optional augmentations."""
 
     def __init__(self, *args,
                  pointcloud_path=None,
@@ -15,6 +17,8 @@ class KITTIOdomPointDataset(KITTIOdomDataset):
                  pc_min_range=0.5,
                  pc_max_range=80.0,
                  return_intensity=True,
+                 lidar_sector_dropout_prob=0.0,
+                 lidar_sector_dropout_angle=35.0,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.pointcloud_root = pointcloud_path or os.path.join(self.data_path, "pointclouds")
@@ -22,17 +26,36 @@ class KITTIOdomPointDataset(KITTIOdomDataset):
         self.pc_min_range = pc_min_range
         self.pc_max_range = pc_max_range
         self.return_intensity = return_intensity
+        self.lidar_sector_dropout_prob = float(max(0.0, min(1.0, lidar_sector_dropout_prob)))
+        self.lidar_sector_dropout_angle = float(max(0.0, lidar_sector_dropout_angle))
 
     def _pointcloud_path(self, folder, frame_index):
         seq = f"{int(folder):02d}"
         filename = f"{frame_index:06d}.bin"
         return os.path.join(self.pointcloud_root, seq, filename)
 
+    def _apply_lidar_sector_dropout(self, points):
+        if points.size == 0:
+            return points
+        sector_width = math.radians(self.lidar_sector_dropout_angle)
+        if sector_width <= 0:
+            return points
+        yaw = np.arctan2(points[:, 1], points[:, 0])
+        center = random.uniform(-math.pi, math.pi)
+        diff = (yaw - center + math.pi) % (2 * math.pi) - math.pi
+        mask = np.abs(diff) > sector_width * 0.5
+        if mask.sum() == 0:
+            return points
+        return points[mask]
+
     def _load_pointcloud(self, folder, frame_index):
         path = self._pointcloud_path(folder, frame_index)
         if not os.path.isfile(path):
             return None, 0
         points = pointcloud_ops.load_kitti_bin(path)
+        if self.is_train and self.lidar_sector_dropout_prob > 0.0:
+            if random.random() < self.lidar_sector_dropout_prob:
+                points = self._apply_lidar_sector_dropout(points)
         points = pointcloud_ops.filter_by_range(points, self.pc_min_range, self.pc_max_range)
         valid_count = points.shape[0]
         if self.pc_max_points and valid_count > self.pc_max_points:

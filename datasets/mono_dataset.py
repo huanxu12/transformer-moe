@@ -12,6 +12,7 @@ import numpy as np
 import copy
 from PIL import Image  # using pillow-simd for increased speed
 import PIL.Image as pil
+from PIL import ImageDraw
 
 import torch
 import torch.utils.data as data
@@ -53,7 +54,10 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
-                 img_ext='.png'):
+                 img_ext='.png',
+                 image_occlusion_prob=0.0,
+                 image_occlusion_area=(0.08, 0.25),
+                 image_occlusion_color='zero'):
         super(MonoDataset, self).__init__()
 
         self.data_path = data_path
@@ -74,6 +78,19 @@ class MonoDataset(data.Dataset):
 
         self.is_train = is_train
         self.img_ext = img_ext
+
+        self.image_occlusion_prob = float(max(0.0, image_occlusion_prob))
+        if isinstance(image_occlusion_area, (list, tuple)) and len(image_occlusion_area) == 2:
+            area_min = float(min(image_occlusion_area))
+            area_max = float(max(image_occlusion_area))
+        else:
+            raise ValueError("image_occlusion_area must be a sequence of two floats")
+        area_min = max(0.0, area_min)
+        area_max = min(1.0, max(area_min, area_max))
+        self.image_occlusion_area = (area_min, area_max)
+        if image_occlusion_color not in {"zero", "mean", "random"}:
+            raise ValueError("image_occlusion_color must be one of {'zero','mean','random'}")
+        self.image_occlusion_color = image_occlusion_color
 
         self.loader = pil_loader
         self.seg_loader = seg_loader
@@ -181,6 +198,8 @@ class MonoDataset(data.Dataset):
             else:
                 inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
 
+        self._maybe_apply_image_occlusion(inputs)
+
         ## IMU
         imu_path = os.path.join(self.data_path, 'imus', '{:02d}.mat'.format(int(folder)))
         if os.path.exists(imu_path):
@@ -225,6 +244,61 @@ class MonoDataset(data.Dataset):
             inputs["stereo_T"] = torch.from_numpy(stereo_T)
 
         return inputs
+
+    def _sample_occlusion_box(self, image):
+        width, height = image.size
+        if width <= 1 or height <= 1:
+            return None
+        area_min, area_max = self.image_occlusion_area
+        occ_w = max(1, int(width * random.uniform(area_min, area_max)))
+        occ_h = max(1, int(height * random.uniform(area_min, area_max)))
+        occ_w = min(width - 1, occ_w)
+        occ_h = min(height - 1, occ_h)
+        if occ_w <= 0 or occ_h <= 0:
+            return None
+        x0 = random.randint(0, width - occ_w)
+        y0 = random.randint(0, height - occ_h)
+        x1 = min(width - 1, x0 + occ_w)
+        y1 = min(height - 1, y0 + occ_h)
+        return x0, y0, x1, y1
+
+    def _occlusion_fill_color(self, image):
+        if self.image_occlusion_color == 'mean':
+            arr = np.asarray(image.convert('RGB'), dtype=np.float32)
+            mean_vals = arr.reshape(-1, arr.shape[-1]).mean(axis=0)
+            return tuple(int(v) for v in np.clip(mean_vals, 0, 255))
+        if self.image_occlusion_color == 'random':
+            return tuple(random.randint(0, 255) for _ in range(3))
+        return (0, 0, 0)
+
+    def _apply_occlusion_patch(self, image, box, fill_color):
+        image = image.copy()
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(box, fill=fill_color)
+        return image
+
+    def _maybe_apply_image_occlusion(self, inputs):
+        if not self.is_train or self.image_occlusion_prob <= 0:
+            return
+        if random.random() >= self.image_occlusion_prob:
+            return
+        base_key = None
+        for key in inputs:
+            if isinstance(key, tuple) and len(key) == 3 and key[0] == "color" and key[2] == -1:
+                base_key = key
+                break
+        if base_key is None:
+            return
+        image = inputs[base_key]
+        if not hasattr(image, 'size'):
+            return
+        box = self._sample_occlusion_box(image)
+        if box is None:
+            return
+        fill_color = self._occlusion_fill_color(image)
+        for key in list(inputs.keys()):
+            if isinstance(key, tuple) and len(key) == 3 and key[0] == "color" and key[2] == -1:
+                inputs[key] = self._apply_occlusion_patch(inputs[key], box, fill_color)
 
     def get_color(self, folder, frame_index, side, do_flip):
         raise NotImplementedError

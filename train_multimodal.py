@@ -15,6 +15,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from tqdm import tqdm
 
 from evaluations.options import BotVIOOptions
+from evaluations.eval_odom import _align_poses as _align_poses_for_metrics
+from evaluations.eval_odom import _compute_metrics as _compute_trajectory_metrics
 from datasets import KITTIOdomPointDataset
 from networks import VisualEncoder, IMUEncoder, PointEncoder, Trans_Fusion, PoseRegressor
 
@@ -36,6 +38,67 @@ def _parse_sequences(seq_text):
 
 def collate_fn(batch):
     return batch[0]
+
+def _parse_dropout_schedule(schedule_str):
+    pairs = []
+    if not schedule_str:
+        return pairs
+    for token in schedule_str.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if ':' not in token:
+            raise ValueError(f"Invalid pose_dropout_schedule token: {token}")
+        epoch_txt, prob_txt = token.split(':', 1)
+        epoch = max(0, int(epoch_txt.strip()))
+        prob = max(0.0, min(1.0, float(prob_txt.strip())))
+        pairs.append((epoch, prob))
+    pairs.sort(key=lambda item: item[0])
+    return pairs
+
+
+def _build_dropout_scheduler(schedule_str):
+    schedule = _parse_dropout_schedule(schedule_str)
+    if not schedule:
+        return None
+
+    def scheduler(epoch_idx):
+        if not schedule:
+            return None
+        if epoch_idx <= schedule[0][0]:
+            return schedule[0][1]
+        for i in range(1, len(schedule)):
+            start_epoch, start_prob = schedule[i - 1]
+            end_epoch, end_prob = schedule[i]
+            if epoch_idx <= end_epoch:
+                span = max(1, end_epoch - start_epoch)
+                ratio = (epoch_idx - start_epoch) / span
+                return start_prob + ratio * (end_prob - start_prob)
+        return schedule[-1][1]
+
+    return scheduler
+
+def _axis_angle_to_matrix(axis_angle):
+    theta = float(np.linalg.norm(axis_angle))
+    if theta < 1e-8:
+        return np.eye(3, dtype=np.float64)
+    axis = axis_angle / theta
+    x, y, z = axis
+    skew = np.array([
+        [0.0, -z, y],
+        [z, 0.0, -x],
+        [-y, x, 0.0],
+    ], dtype=np.float64)
+    sin_theta = math.sin(theta)
+    cos_theta = math.cos(theta)
+    eye = np.eye(3, dtype=np.float64)
+    return eye + sin_theta * skew + (1.0 - cos_theta) * (skew @ skew)
+
+def _compose_transform(rot_vec, trans_vec):
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = _axis_angle_to_matrix(rot_vec)
+    transform[:3, 3] = trans_vec.astype(np.float64)
+    return transform
 
 def build_file_list(data_root, sequences=None):
     seq_root = Path(data_root) / "sequences"
@@ -167,8 +230,10 @@ class MultimodalModel(nn.Module):
         self.visual_encoder = VisualEncoder(out_dim=opts.v_f_len)
         self.point_encoder = PointEncoder(in_channels=4, out_dim=opts.v_f_len)
         self.imu_encoder = IMUEncoder(out_dim=opts.i_f_len)
-        self.fusion = Trans_Fusion(dim=opts.v_f_len, imu_dim=opts.i_f_len, point_dim=opts.v_f_len)
-        self.pose_head = PoseRegressor(in_dim=opts.v_f_len, hidden_dim=256)
+        fusion_drop = getattr(opts, 'fusion_drop_prob', 0.0)
+        pose_dropout = getattr(opts, 'pose_dropout', 0.0)
+        self.fusion = Trans_Fusion(dim=opts.v_f_len, imu_dim=opts.i_f_len, point_dim=opts.v_f_len, drop_prob=fusion_drop)
+        self.pose_head = PoseRegressor(in_dim=opts.v_f_len, hidden_dim=256, dropout=pose_dropout)
 
     def forward(self, inputs):
         visual = inputs['visual']
@@ -272,6 +337,13 @@ def train_epoch(model, loader, optimizer, scheduler, device, pose_cache, opts, u
 
 def run_validation(model, device, opts, val_sequences, epoch):
     val_file_list = build_file_list(opts.data_path, sequences=val_sequences)
+    occ_area_cfg = getattr(opts, 'aug_image_occlusion_area', [0.08, 0.25])
+    if not isinstance(occ_area_cfg, (list, tuple)) or len(occ_area_cfg) != 2:
+        raise ValueError('aug_image_occlusion_area must provide two values')
+    occ_min = float(min(occ_area_cfg))
+    occ_max = float(max(occ_area_cfg))
+    occ_min = max(0.0, occ_min)
+    occ_max = min(1.0, max(occ_min, occ_max))
     val_dataset = KITTIOdomPointDataset(
         opts.data_path,
         val_file_list,
@@ -285,7 +357,12 @@ def run_validation(model, device, opts, val_sequences, epoch):
         pc_max_points=opts.pc_max_points,
         pc_min_range=opts.pc_min_range,
         pc_max_range=opts.pc_max_range,
-        return_intensity=True
+        return_intensity=True,
+        image_occlusion_prob=opts.aug_image_occlusion_prob,
+        image_occlusion_area=(occ_min, occ_max),
+        image_occlusion_color=opts.aug_image_occlusion_color,
+        lidar_sector_dropout_prob=opts.aug_lidar_sector_dropout_prob,
+        lidar_sector_dropout_angle=opts.aug_lidar_sector_dropout_angle
     )
     loader = DataLoader(
         val_dataset,
@@ -305,6 +382,12 @@ def run_validation(model, device, opts, val_sequences, epoch):
     }
     count = 0
     pose_cache = {}
+    seq_states = {}
+    straight_sq = 0.0
+    straight_count = 0
+    turn_sq = 0.0
+    turn_count = 0
+    turn_threshold = getattr(opts, 'val_turn_threshold', 0.05)
     model.eval()
     with torch.no_grad():
         for batch in loader:
@@ -327,6 +410,34 @@ def run_validation(model, device, opts, val_sequences, epoch):
             totals['trans_l2'] += float(np.linalg.norm(trans_diff))
             count += 1
 
+            if np.linalg.norm(rot_gt) >= turn_threshold:
+                turn_sq += float(np.sum(trans_diff ** 2))
+                turn_count += 1
+            else:
+                straight_sq += float(np.sum(trans_diff ** 2))
+                straight_count += 1
+
+            frame_idx = int(frame)
+            state = seq_states.get(seq)
+            if state is None:
+                state = {
+                    'current_pose': np.eye(4, dtype=np.float64),
+                    'poses': {frame_idx: np.eye(4, dtype=np.float64)},
+                    'last_frame': frame_idx,
+                }
+                seq_states[seq] = state
+            expected = state['last_frame']
+            if frame_idx != expected:
+                raise RuntimeError(
+                    f"Validation encountered non-consecutive frame index for sequence {seq}: "
+                    f"expected {expected}, got {frame_idx}"
+                )
+            step_transform = _compose_transform(rot_vec, trans_vec)
+            state['current_pose'] = state['current_pose'] @ step_transform
+            next_frame = frame_idx + 1
+            state['poses'][next_frame] = state['current_pose'].copy()
+            state['last_frame'] = next_frame
+
     if count == 0:
         raise RuntimeError('Validation dataset is empty')
 
@@ -337,8 +448,50 @@ def run_validation(model, device, opts, val_sequences, epoch):
     totals['trans_rmse'] = float(np.sqrt(totals['trans_rmse'] / count))
     totals['trans_l2'] /= count
 
+    if straight_count > 0:
+        totals['straight_trans_rmse'] = float(np.sqrt(straight_sq / straight_count))
+    else:
+        totals['straight_trans_rmse'] = float('nan')
+    if turn_count > 0:
+        totals['turn_trans_rmse'] = float(np.sqrt(turn_sq / turn_count))
+    else:
+        totals['turn_trans_rmse'] = float('nan')
+
+    ate_metrics = {'sequences': {}, 'overall': {}}
+    total_poses = 0
+    for seq, state in seq_states.items():
+        indices = sorted(state['poses'].keys())
+        pred_poses = [state['poses'][idx] for idx in indices]
+        gt_sequence = pose_cache[seq]
+        gt_poses = [gt_sequence[idx] for idx in indices]
+        aligned_pred = _align_poses_for_metrics(pred_poses, gt_poses, allow_scale=False)
+        seq_metric = _compute_trajectory_metrics(gt_poses, aligned_pred)
+        seq_metric['num_poses'] = len(indices)
+        ate_metrics['sequences'][seq] = seq_metric
+        total_poses += len(indices)
+
+    if total_poses > 0 and ate_metrics['sequences']:
+        agg = {
+            'ate_rmse': 0.0,
+            'ate_mean': 0.0,
+            'ate_median': 0.0,
+            'rpe_rot_rmse': 0.0,
+            'rpe_trans_rmse': 0.0,
+        }
+        for metrics in ate_metrics['sequences'].values():
+            weight = metrics['num_poses']
+            for key in agg:
+                agg[key] += metrics[key] * weight
+        for key in agg:
+            agg[key] /= total_poses
+        agg['num_poses'] = total_poses
+        ate_metrics['overall'] = agg
+        totals['val_ate_rmse'] = agg['ate_rmse']
+        totals['val_rpe_trans_rmse'] = agg['rpe_trans_rmse']
+        totals['val_rpe_rot_rmse'] = agg['rpe_rot_rmse']
+
     model.train()
-    return totals, count
+    return totals, count, ate_metrics
 
 def main():
     opts = BotVIOOptions().parse()
@@ -347,6 +500,13 @@ def main():
     train_sequences = _parse_sequences(opts.train_sequences)
     file_list = build_file_list(opts.data_path, sequences=train_sequences)
 
+    occ_area_cfg = getattr(opts, 'aug_image_occlusion_area', [0.08, 0.25])
+    if not isinstance(occ_area_cfg, (list, tuple)) or len(occ_area_cfg) != 2:
+        raise ValueError('aug_image_occlusion_area must provide two values')
+    occ_min = float(min(occ_area_cfg))
+    occ_max = float(max(occ_area_cfg))
+    occ_min = max(0.0, occ_min)
+    occ_max = min(1.0, max(occ_min, occ_max))
     dataset = KITTIOdomPointDataset(
         opts.data_path,
         file_list,
@@ -360,7 +520,12 @@ def main():
         pc_max_points=opts.pc_max_points,
         pc_min_range=opts.pc_min_range,
         pc_max_range=opts.pc_max_range,
-        return_intensity=True
+        return_intensity=True,
+        image_occlusion_prob=opts.aug_image_occlusion_prob,
+        image_occlusion_area=(occ_min, occ_max),
+        image_occlusion_color=opts.aug_image_occlusion_color,
+        lidar_sector_dropout_prob=opts.aug_lidar_sector_dropout_prob,
+        lidar_sector_dropout_angle=opts.aug_lidar_sector_dropout_angle
     )
 
     if opts.train_batch_size != 1:
@@ -388,6 +553,16 @@ def main():
             print(f"  Missing keys: {missing}")
         if unexpected:
             print(f"  Unexpected keys: {unexpected}")
+
+    visual_blocks = max(0, int(getattr(opts, 'freeze_visual_blocks', 0)))
+    if not opts.freeze_visual and visual_blocks > 0:
+        model.visual_encoder.freeze_blocks(visual_blocks)
+        print('[train_multimodal] Visual encoder front {} block(s) frozen'.format(visual_blocks))
+
+    point_stages = max(0, int(getattr(opts, 'freeze_point_layers', 0)))
+    if not opts.freeze_point and point_stages > 0:
+        model.point_encoder.freeze_stages(point_stages)
+        print('[train_multimodal] Point encoder front {} stage(s) frozen'.format(point_stages))
 
     if opts.freeze_visual:
         model.visual_encoder.requires_grad_(False)
@@ -432,6 +607,9 @@ def main():
         patience_counter = 0
 
     pose_cache = {}
+    dropout_scheduler = _build_dropout_scheduler(getattr(opts, 'pose_dropout_schedule', None))
+    base_pose_dropout = float(getattr(opts, 'pose_dropout', 0.0))
+    last_dropout_value = None
     history = []
 
     csv_writer = None
@@ -441,9 +619,17 @@ def main():
         log_path.parent.mkdir(parents=True, exist_ok=True)
         csv_handle = log_path.open('w', newline='', encoding='utf-8')
         csv_writer = csv.writer(csv_handle)
-        header = ['epoch', 'loss']
+        header = ['epoch', 'loss', 'pose_dropout']
         if use_validation:
-            header.extend(['val_trans_rmse', 'val_rot_rmse'])
+            header.extend([
+                'val_trans_rmse',
+                'val_rot_rmse',
+                'val_ate_rmse',
+                'val_rpe_trans_rmse',
+                'val_rpe_rot_rmse',
+                'val_straight_trans_rmse',
+                'val_turn_trans_rmse',
+            ])
         csv_writer.writerow(header)
 
     output_path = Path(opts.output_checkpoint)
@@ -460,23 +646,46 @@ def main():
     val_interval = max(1, getattr(opts, 'val_interval', 1))
 
     for epoch in range(opts.num_epochs):
+        if dropout_scheduler:
+            current_dropout = float(dropout_scheduler(epoch))
+        else:
+            current_dropout = base_pose_dropout
+        model.pose_head.set_dropout(current_dropout)
+        if last_dropout_value is None or abs(current_dropout - last_dropout_value) > 1e-6:
+            print(f"[train_multimodal] Epoch {epoch + 1}: pose dropout -> {current_dropout:.4f}")
+        last_dropout_value = current_dropout
         loss = train_epoch(model, loader, optimizer, scheduler, device, pose_cache, opts,
                            use_batch_scheduler=not use_validation)
 
-        record = {'epoch': epoch + 1, 'loss': loss}
+        record = {'epoch': epoch + 1, 'loss': loss, 'pose_dropout': current_dropout}
         print(f"Epoch {epoch + 1}/{opts.num_epochs}: loss={loss:.4f}")
 
         val_metrics = None
         if use_validation and ((epoch + 1) % val_interval == 0):
-            val_metrics, val_count = run_validation(model, device, opts, val_sequences, epoch + 1)
+            val_metrics, val_count, val_traj_metrics = run_validation(model, device, opts, val_sequences, epoch + 1)
             record['val_trans_rmse'] = val_metrics['trans_rmse']
             record['val_rot_rmse'] = val_metrics['rot_rmse']
-            print(f"  Validation (epoch {epoch + 1}): trans_rmse={val_metrics['trans_rmse']:.4f}, rot_rmse={val_metrics['rot_rmse']:.4f}")
+            record['val_ate_rmse'] = val_metrics.get('val_ate_rmse', float('nan'))
+            record['val_rpe_trans_rmse'] = val_metrics.get('val_rpe_trans_rmse', float('nan'))
+            record['val_rpe_rot_rmse'] = val_metrics.get('val_rpe_rot_rmse', float('nan'))
+            record['val_straight_trans_rmse'] = val_metrics.get('straight_trans_rmse', float('nan'))
+            record['val_turn_trans_rmse'] = val_metrics.get('turn_trans_rmse', float('nan'))
+            print(
+                f"  Validation (epoch {epoch + 1}): "
+                f"trans_rmse={val_metrics['trans_rmse']:.4f}, "
+                f"rot_rmse={val_metrics['rot_rmse']:.4f}, "
+                f"ate_rmse={record['val_ate_rmse']:.4f}"
+            )
 
             if val_metrics_dir:
                 epoch_file = val_metrics_dir / f"epoch{epoch + 1:03d}.json"
                 with epoch_file.open('w', encoding='utf-8') as handle:
-                    json.dump({'epoch': epoch + 1, 'samples': val_count, 'metrics': val_metrics}, handle, indent=2)
+                    json.dump({
+                        'epoch': epoch + 1,
+                        'samples': val_count,
+                        'metrics': val_metrics,
+                        'trajectory_metrics': val_traj_metrics,
+                    }, handle, indent=2)
 
             scheduler.step(val_metrics['trans_rmse'])
 
@@ -496,10 +705,21 @@ def main():
         history.append(record)
 
         if csv_writer:
-            row = [epoch + 1, f"{loss:.6f}"]
+            row = [epoch + 1, f"{loss:.6f}", f"{record['pose_dropout']:.6f}"]
             if use_validation:
-                row.append(f"{record.get('val_trans_rmse', float('nan')):.6f}" if 'val_trans_rmse' in record else '')
-                row.append(f"{record.get('val_rot_rmse', float('nan')):.6f}" if 'val_rot_rmse' in record else '')
+                def fmt(key):
+                    value = record.get(key, float('nan'))
+                    return f"{value:.6f}" if isinstance(value, (int, float)) and not np.isnan(value) else ''
+
+                row.extend([
+                    fmt('val_trans_rmse'),
+                    fmt('val_rot_rmse'),
+                    fmt('val_ate_rmse'),
+                    fmt('val_rpe_trans_rmse'),
+                    fmt('val_rpe_rot_rmse'),
+                    fmt('val_straight_trans_rmse'),
+                    fmt('val_turn_trans_rmse'),
+                ])
             csv_writer.writerow(row)
             csv_handle.flush()
 
@@ -524,9 +744,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
-
-
-
-

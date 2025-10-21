@@ -37,6 +37,28 @@ class BotVIOOptions:
                                  help="maximum radial distance to keep point (meters)",
                                  default=80.0)
 
+        self.parser.add_argument("--aug_image_occlusion_prob",
+                                 type=float,
+                                 help="probability of rectangular occlusion augmentation on training images",
+                                 default=0.0)
+        self.parser.add_argument("--aug_image_occlusion_area",
+                                 type=float, nargs=2, metavar=('MIN', 'MAX'),
+                                 help="relative occlusion area range (fraction of width/height)",
+                                 default=[0.08, 0.25])
+        self.parser.add_argument("--aug_image_occlusion_color",
+                                 type=str,
+                                 choices=['zero', 'mean', 'random'],
+                                 help="fill colour for occlusion patches",
+                                 default='zero')
+        self.parser.add_argument("--aug_lidar_sector_dropout_prob",
+                                 type=float,
+                                 help="probability of removing a LiDAR azimuth sector during training",
+                                 default=0.0)
+        self.parser.add_argument("--aug_lidar_sector_dropout_angle",
+                                 type=float,
+                                 help="angular width in degrees for LiDAR sector dropout",
+                                 default=35.0)
+
         # TRAINING options
         self.parser.add_argument("--train_sequences",
                                  type=str,
@@ -49,9 +71,17 @@ class BotVIOOptions:
         self.parser.add_argument("--freeze_visual",
                                  help="freeze visual encoder during training",
                                  action="store_true")
+        self.parser.add_argument("--freeze_visual_blocks",
+                                 type=int,
+                                 help="freeze first N convolution blocks in visual encoder",
+                                 default=0)
         self.parser.add_argument("--freeze_point",
                                  help="freeze point encoder during training",
                                  action="store_true")
+        self.parser.add_argument("--freeze_point_layers",
+                                 type=int,
+                                 help="freeze first N MLP stages in point encoder",
+                                 default=0)
         self.parser.add_argument("--freeze_imu",
                                  help="freeze IMU encoder during training",
                                  action="store_true")
@@ -83,6 +113,18 @@ class BotVIOOptions:
                                  type=float,
                                  help="weight decay in AdamW",
                                  default=1e-2)
+        self.parser.add_argument("--fusion_drop_prob",
+                                 type=float,
+                                 help="dropout probability inside Trans_Fusion gates",
+                                 default=0.0)
+        self.parser.add_argument("--pose_dropout",
+                                 type=float,
+                                 help="dropout probability between PoseRegressor fully-connected layers",
+                                 default=0.0)
+        self.parser.add_argument("--pose_dropout_schedule",
+                                 type=str,
+                                 help="epoch:prob pairs for adaptive pose dropout, e.g. '0:0.15,5:0.05,10:0.0'",
+                                 default=None)
         self.parser.add_argument("--drop_path",
                                  type=float,
                                  help="drop path rate",
